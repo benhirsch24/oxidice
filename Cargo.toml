@@ -1,0 +1,14 @@
+[package]
+name = "oxidice"
+version = "0.1.0"
+authors = ["benhirsch24 <hirschb@lab126.com>"]
+edition = "2018"
+
+[dependencies]
+byteorder = "1.2"
+clap = "2.32"
+log = "0.4"
+nix = "0.11"
+simple_logger = "1.0"
+rand = "0.5"
+tokio = "0.1"
