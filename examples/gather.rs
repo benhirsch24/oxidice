@@ -99,5 +99,10 @@ fn main() {
     };
 
     // Now that we've exchanged candidates, convert the remote candidates
+    let remote_candidates : Vec<Candidate> = remote_candidates_sdp.split('\n')
+        .filter(|c| !c.is_empty())
+        .map(|c| candidate_from_sdp(c).unwrap())
+        .collect();
+    println!("Received remote candidates: {:?}", remote_candidates);
     //agent.set_remote_candidates(stream_id, candidates);
 }

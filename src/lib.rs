@@ -1,5 +1,9 @@
 #[macro_use]
 extern crate log;
+#[macro_use]
+extern crate nom;
+use nom::{rest};
+
 extern crate nix;
 extern crate rand;
 
@@ -7,7 +11,7 @@ use nix::ifaddrs::InterfaceAddress;
 use nix::sys::socket::{InetAddr, SockAddr};
 use rand::{ThreadRng, Rng};
 use std::collections::HashMap;
-use std::net::{IpAddr, UdpSocket};
+use std::net::{AddrParseError, IpAddr, SocketAddr, UdpSocket};
 use std::sync::{Arc, Mutex};
 
 pub const MIN_EPHEMERAL_PORT : u16 = 49152;
@@ -23,14 +27,14 @@ pub enum CandidateType {
 
 fn cand_type_as_sdp(cand_type: &CandidateType) -> String {
     match cand_type {
-        Host => "host".to_string(),
-        ServerReflexive => "srflx".to_string(),
-        PeerReflexive => "prflx".to_string(),
-        Relay => "relay".to_string()
+        CandidateType::Host => "host".to_string(),
+        CandidateType::ServerReflexive => "srflx".to_string(),
+        CandidateType::PeerReflexive => "prflx".to_string(),
+        CandidateType::Relay => "relay".to_string()
     }
 }
 
-fn to_type_preference(cand: &CandidateType) -> u32 {
+fn to_type_preference(cand: &CandidateType) -> u64 {
     match cand {
         CandidateType::Host => 126,
         CandidateType::ServerReflexive => 100,
@@ -48,35 +52,50 @@ pub enum CandidateSocket {
 #[derive(Clone, Debug)]
 pub struct Candidate {
     candidate_type: CandidateType,
-    candidate_socket: Arc<Mutex<CandidateSocket>>,
+    candidate_socket: Option<Arc<Mutex<CandidateSocket>>>,
+    candidate_addr: SocketAddr,
     component_id: usize,
-    foundation: String
+    foundation: String,
+    priority: u64
 }
 
 impl Candidate {
-    fn new(cand_type: CandidateType, socket: Arc<Mutex<CandidateSocket>>, component_id: usize, foundation: String) -> Candidate {
-        Candidate {
+    fn new(cand_type: CandidateType,
+           socket: Option<Arc<Mutex<CandidateSocket>>>,
+           sock_addr: SocketAddr,
+           component_id: usize,
+           foundation: String,
+           priority_opt: Option<u64>) -> Candidate
+    {
+        let mut c = Candidate {
             candidate_type: cand_type,
             candidate_socket: socket,
+            candidate_addr: sock_addr,
             component_id: component_id,
-            foundation: foundation
-        }
+            foundation: foundation,
+            priority: 0
+        };
+        match priority_opt {
+            Some(p) => c.priority = p,
+            None => c.compute_priority()
+        };
+        c
     }
 
     /// Gets the candidate's type preference.
-    pub fn get_type_preference(&self) -> u32 {
+    pub fn get_type_preference(&self) -> u64 {
         to_type_preference(&self.candidate_type)
     }
 
     /// Gets the candidate's local preference.
-    pub fn get_local_preference(&self) -> u32 {
+    pub fn get_local_preference(&self) -> u64 {
         0
     }
 
     /// Gets the priority of this candidate based on its type & local preference and its component
     /// id.
-    pub fn get_priority(&self) -> u32 {
-        0x1000000 * self.get_type_preference() + 0x100 * self.get_local_preference() + (0x100 - self.component_id as u32)
+    pub fn compute_priority(&mut self) {
+        self.priority = 0x1000000 * self.get_type_preference() + 0x100 * self.get_local_preference() + (0x100 - self.component_id as u64);
     }
 
     /// Converts this candidate into an SDP a= line. Format should be:
@@ -87,29 +106,111 @@ impl Candidate {
         // a=candidate:foundation component-id transport priority connection-address
         // port candidate-type [relative address?] [relative port?]
         // *(extension-attribute-name extension-attribute-value)
-        let (conn_addr, port) = match *self.candidate_socket.lock().unwrap() {
-            CandidateSocket::Udp(ref s) => {
-                let local_addr = s.local_addr().unwrap();
-                (local_addr.ip().to_string(), local_addr.port().to_string())
+        format!("a=candidate:{} {} {} {} {} {} typ {}", self.foundation, self.component_id, "udp", self.priority,
+            self.candidate_addr.ip(), self.candidate_addr.port(), cand_type_as_sdp(&self.candidate_type))
+    }
+}
+
+fn is_digit(c: char) -> bool {
+    c.is_digit(10)
+}
+
+named!(i32_parse<&str, i32>,
+       map_res!(
+           take_while!(is_digit),
+                |s: &str| s.parse::<i32>()));
+
+named!(u16_parse<&str, u16>,
+       map_res!(
+           take_while!(is_digit),
+                |s: &str| s.parse::<u16>()));
+
+named!(u64_parse<&str, u64>,
+       map_res!(
+           take_while!(is_digit),
+                |s: &str| s.parse::<u64>()));
+
+fn cand_type_from_str(s: &str) -> Option<CandidateType> {
+    match s {
+        "host"  => Some(CandidateType::Host),
+        "srflx" => Some(CandidateType::ServerReflexive),
+        "prflx" => Some(CandidateType::PeerReflexive),
+        "relay" => Some(CandidateType::Relay),
+        _ => None
+    }
+}
+
+named!(candidate_sdp_parser<&str, Candidate>, do_parse!(
+        tag_s!("a=candidate:") >>
+        foundation: take_until!(" ") >>
+        component_id: ws!(i32_parse) >>
+        transport: ws!(alt!(tag_s!("udp") | tag_s!("tcp"))) >>
+        priority: ws!(u64_parse) >>
+        conn_addr: map_res!(take_until!(" "), |s: &str| -> Result<IpAddr, AddrParseError> { s.parse()}) >>
+        port: ws!(u16_parse) >>
+        tag_s!("typ ") >> cand_type: map_opt!(rest, cand_type_from_str) >>
+        (Candidate::new(cand_type,
+                        None,
+                        SocketAddr::new(conn_addr, port),
+                        component_id as usize,
+                        foundation.to_string(),
+                        Some(priority)))
+        ));
+
+pub fn candidate_from_sdp(candidate_str: &str) -> Option<Candidate> {
+    match candidate_sdp_parser(candidate_str) {
+        Ok((_, r)) => Some(r),
+        Err(e) => match e {
+            nom::Err::Incomplete(n) => {
+                println!("Incomplete candidate parsing: {:?}", n);
+                None
             },
-            //_      => "unknown".to_string()
+            nom::Err::Error(ctx) => {
+                println!("Error when parsing candidate {:?}", ctx);
+                None
+            }
+            nom::Err::Failure(ctx) => {
+                println!("Failure when parsing candidate {:?}", ctx);
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn sdp_parser_test() {
+        let sdp = "a=candidate:4000 1 udp 1212 127.0.0.1 8000 typ host";
+        let parsed_candidate = match super::candidate_sdp_parser(sdp) {
+            Ok((_, r)) => r,
+            Err(e) => match e {
+                nom::Err::Incomplete(n) => panic!("Needed: {:?}", n),
+                nom::Err::Error(ctx) => panic!("ERROR {:?}", ctx),
+                nom::Err::Failure(ctx) => panic!("Failure {:?}", ctx)
+            }
         };
-        format!("a=candidate:{} {} {} {} {} {} typ {}", self.foundation, self.component_id, "udp", self.get_priority(),
-            conn_addr, port, cand_type_as_sdp(&self.candidate_type))
+        assert_eq!(parsed_candidate.candidate_type, super::CandidateType::Host);
+        assert_eq!(parsed_candidate.component_id, 1);
+        assert_eq!(parsed_candidate.foundation, "4000".to_string());
+        assert_eq!(parsed_candidate.priority, 1212);
+        assert_eq!(parsed_candidate.candidate_addr, super::SocketAddr::new("127.0.0.1".parse().unwrap(), 8000));
     }
 }
 
 #[derive(Debug)]
 struct Component {
     component_id: usize,
-    candidates: Vec<Candidate>
+    candidates: Vec<Candidate>,
+    remote_candidates: Vec<Candidate>,
 }
 
 impl Component {
     pub fn new(cid: usize) -> Component {
         Component {
             component_id: cid,
-            candidates: vec![]
+            candidates: vec![],
+            remote_candidates: vec![],
         }
     }
 
@@ -196,41 +297,42 @@ impl Agent {
         let candidate_type = CandidateType::Host;
         for component_id in 0..stream_components {
             for addr in self.local_addrs.as_ref().unwrap() {
-                let socket = self.attempt_socket_bind(&mut rng, addr);
-                if let Ok(s) = socket {
-                    debug!("Successfully bound to socket addr {:?}", s);
-                    let foundation = Foundation {
-                        candidate_type: candidate_type.clone(),
-                        ip: s.local_addr().unwrap().ip().clone(),
-                        server: None,
-                        sock_type: SockType::Udp
-                    };
-                    let foundation_str = match foundation_strings.get(&foundation) {
-                        Some(f) => f.clone(),
-                        None => {
-                            let found;
-                            loop {
-                                let f = rng.gen_range(0, std::u16::MAX).to_string();
-                                if string_foundations.contains_key(&f) {
-                                    continue;
-                                } else {
-                                    string_foundations.insert(f.clone(), foundation.clone());
-                                    foundation_strings.insert(foundation.clone(), f.clone());
-                                    found = f;
-                                    break;
-                                }
+                let socket = self.attempt_socket_bind(&mut rng, addr)?;
+                debug!("Successfully bound to socket addr {:?}", socket);
+                let foundation = Foundation {
+                    candidate_type: candidate_type.clone(),
+                    ip: socket.local_addr().unwrap().ip().clone(),
+                    server: None,
+                    sock_type: SockType::Udp
+                };
+                let foundation_str = match foundation_strings.get(&foundation) {
+                    Some(f) => f.clone(),
+                    None => {
+                        let found;
+                        loop {
+                            let f = rng.gen_range(0, std::u16::MAX).to_string();
+                            if string_foundations.contains_key(&f) {
+                                continue;
+                            } else {
+                                string_foundations.insert(f.clone(), foundation.clone());
+                                foundation_strings.insert(foundation.clone(), f.clone());
+                                found = f;
+                                break;
                             }
-                            found
                         }
-                    };
-                    let candidate = Candidate::new(candidate_type.clone(),
-                                                   Arc::new(Mutex::new(CandidateSocket::Udp(s))),
-                                                   component_id,
-                                                   foundation_str);
-                    let component = &mut self.streams[stream_id-1].components[component_id];
-                    component.add_candidate(candidate.clone());
-                    candidates.push(candidate);
-                }
+                        found
+                    }
+                };
+                let addr = socket.local_addr().unwrap().clone();
+                let candidate = Candidate::new(candidate_type.clone(),
+                    Some(Arc::new(Mutex::new(CandidateSocket::Udp(socket)))),
+                    addr,
+                    component_id,
+                    foundation_str,
+                    None);
+                let component = &mut self.streams[stream_id-1].components[component_id];
+                component.add_candidate(candidate.clone());
+                candidates.push(candidate);
             }
         }
         Ok(candidates)
